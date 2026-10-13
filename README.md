@@ -223,7 +223,24 @@ When building bt from source, run `pnpm install --frozen-lockfile --ignore-scrip
 ## `bt preprocessors`
 
 Preprocessors turn a trace into the messages that prompt-based scorers receive for trace template variables.
-Each file default-exports `{ name, slug, handler }`; `handler` receives a span's `input`, `output`, `error`, `metadata`, and `span_attributes` and returns the messages to include for that span.
+Export definitions created with `customPreprocessor` from `braintrust/preprocessors` (SDK 3.36.0 or newer).
+Named and default exports are supported, and push publishes all definitions in each file.
+
+```ts
+import { customPreprocessor } from "braintrust/preprocessors";
+
+export const conversation = customPreprocessor(
+  { name: "Conversation", slug: "conversation" },
+  (span) => {
+    if (span.span_attributes?.type === "score") return null;
+    return typeof span.output === "string" ? span.output : null;
+  },
+);
+```
+
+The handler receives one span, including its `id`, `root_span_id`, `input`, `output`, `error`, `metadata`, and `span_attributes`.
+It must synchronously return a JSON-serializable value, or `null` to skip the span.
+Deployed handlers run in QuickJS; Node.js APIs, network access, and unbundled imports are unavailable.
 
 ```bash
 bt preprocessors bootstrap 'Conversation'
@@ -231,9 +248,10 @@ bt preprocessors preview ./braintrust-preprocessors/conversation.preprocessor.ts
 bt preprocessors push ./braintrust-preprocessors --project test-project --if-exists replace
 ```
 
-Preview runs the local handler on a trace in Braintrust's QuickJS runtime and prints the resulting messages.
+Preview runs the local handler on a trace in Braintrust's QuickJS runtime and prints the result.
+For files with multiple definitions, select an export with `bt preprocessors preview <PATH> --export conversation` (or `--export default` for the default export).
 Push bundles local imports into inline QuickJS code. Set `project` in each definition or use `--project` / your configured project.
-Push and preview require Node.js. Use `bt preprocessors list`, `view`, `invoke`, and `delete` to manage published preprocessors.
+Push and preview require Node.js; the CLI embeds the SDK helper, so a local SDK installation is only needed for editor types and typechecking. Use `bt preprocessors list`, `view`, `invoke`, and `delete` to manage published preprocessors.
 
 ## `bt scorers`
 
@@ -257,6 +275,7 @@ Use `--if-exists error|ignore|replace` to control slug conflicts. Text and struc
 Before writing a scorer, `bt` sends the complete candidate definition to Braintrust for validation. The backend applies the same model-parameter and replacement checks as the write and returns structured issues with normalization suggestions when available.
 
 Use `--preprocessor <SLUG>` to build trace template variables with a preprocessor pushed to the project, `global:<NAME>` for a built-in preprocessor, `@PATH` to inline a local preprocessor file, or `none` to disable preprocessing. Without it, the project's default preprocessor applies.
+When inlining a file with multiple definitions, add `--preprocessor-export <NAME>` to select its named or default export.
 
 For TypeScript and Python code scorers, use the Braintrust SDK and `bt functions push`.
 

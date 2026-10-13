@@ -14,6 +14,7 @@ use crate::functions::{
 use crate::http::ApiClient;
 use crate::js_bundle::{
     collect_matching_files, run_node_metadata_runner, swc_bundle_js_module, SwcBundleTarget,
+    VirtualModule,
 };
 use crate::project_context::{resolve_definition_project, resolve_project_optional};
 use crate::projects::api::Project;
@@ -22,6 +23,11 @@ use crate::ui::{self, with_spinner};
 use crate::utils::slug_from_name;
 
 const PREPROCESSORS_JS_RUNNER_SOURCE: &str = include_str!("../scripts/preprocessors-runner.mjs");
+const PREPROCESSORS_VIRTUAL_MODULES: &[VirtualModule] = &[VirtualModule {
+    specifier: "braintrust/preprocessors",
+    source: include_str!(concat!(env!("OUT_DIR"), "/preprocessors.mjs")),
+    typescript: false,
+}];
 const PREPROCESSOR_RUNTIME: &str = "quickjs";
 const DEFAULT_PREPROCESSORS_DIR: &str = "braintrust-preprocessors";
 const PREPROCESSOR_FILE_PATTERN_HELP: &str =
@@ -157,6 +163,10 @@ struct PreviewArgs {
     )]
     file_flag: Option<PathBuf>,
 
+    /// Export name to preview when the file contains multiple preprocessors.
+    #[arg(long, env = "BT_PREPROCESSORS_PREVIEW_EXPORT", value_name = "NAME")]
+    export: Option<String>,
+
     /// Braintrust app URL of the trace to preprocess.
     #[arg(long, env = "BT_PREPROCESSORS_PREVIEW_URL")]
     url: Option<String>,
@@ -227,8 +237,7 @@ struct PreprocessorsManifestFile {
 struct PreprocessorManifestEntry {
     name: String,
     slug: String,
-    #[serde(default)]
-    description: Option<String>,
+    export_names: Vec<String>,
     code: String,
     #[serde(default)]
     project_id: Option<String>,
@@ -259,6 +268,7 @@ struct BootstrapResult {
     path: String,
 }
 
+#[derive(Debug)]
 pub(crate) struct LocalPreprocessor {
     pub(crate) name: String,
     pub(crate) slug: String,
@@ -325,32 +335,21 @@ fn bootstrap(base: BaseArgs, args: BootstrapArgs) -> Result<()> {
     Ok(())
 }
 
-const PREPROCESSOR_BOOTSTRAP_TEMPLATE: &str = r##"type PreprocessorArgs = {
-  input: any;
-  output: any;
-  error: any;
-  metadata: Record<string, any>;
-  span_attributes: { name?: string; type?: string };
-};
+const PREPROCESSOR_BOOTSTRAP_TEMPLATE: &str = r##"import { customPreprocessor } from "braintrust/preprocessors";
 
-export default {
-  name: __PREPROCESSOR_NAME__,
-  slug: __PREPROCESSOR_SLUG__,
-  handler({ input, output, span_attributes }: PreprocessorArgs): unknown[] {
-    if (span_attributes?.type !== "llm") {
-      return [];
+export const preprocessor = customPreprocessor(
+  { name: __PREPROCESSOR_NAME__, slug: __PREPROCESSOR_SLUG__ },
+  (span) => {
+    if (span.span_attributes?.type !== "llm" || span.output == null) {
+      return null;
     }
 
-    const messages: unknown[] = Array.isArray(input) ? [...input] : [];
-    if (output !== undefined && output !== null) {
-      messages.push({
-        role: "assistant",
-        content: typeof output === "string" ? output : JSON.stringify(output),
-      });
-    }
-    return messages;
+    return [{
+      role: "assistant",
+      content: typeof span.output === "string" ? span.output : JSON.stringify(span.output),
+    }];
   },
-};
+);
 "##;
 
 fn preprocessor_bootstrap_template(name: &str, slug: &str) -> String {
@@ -442,7 +441,7 @@ async fn push(base: BaseArgs, args: PushArgs) -> Result<()> {
 }
 
 async fn preview(base: BaseArgs, args: PreviewArgs) -> Result<()> {
-    let preprocessor = load_local_preprocessor(args.path())?;
+    let preprocessor = load_local_preprocessor(args.path(), args.export.as_deref(), "--export")?;
 
     let parsed_url = args.url.as_deref().map(parse_trace_url).transpose()?;
     let mut base = base.clone();
@@ -540,19 +539,40 @@ fn build_preview_invoke_request(
     })
 }
 
-pub(crate) fn load_local_preprocessor(path: &Path) -> Result<LocalPreprocessor> {
+pub(crate) fn load_local_preprocessor(
+    path: &Path,
+    export: Option<&str>,
+    selector_flag: &str,
+) -> Result<LocalPreprocessor> {
     if !path.is_file() {
         bail!("preprocessor file not found: {}", path.display());
     }
     let manifest = run_preprocessors_runner(&[path.to_path_buf()])?;
     validate_manifest_runtime(&manifest)?;
     let runtime_version = manifest.runtime_context.version;
-    let entry = manifest
+    let entries: Vec<_> = manifest
         .files
         .into_iter()
         .flat_map(|file| file.entries)
-        .next()
-        .ok_or_else(|| anyhow!("no preprocessor was registered by {}", path.display()))?;
+        .collect();
+    let available = entries
+        .iter()
+        .flat_map(|entry| entry.export_names.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let selected = match export {
+        Some(name) => entries.into_iter().find(|entry| entry.export_names.iter().any(|export| export == name)),
+        None if entries.len() == 1 => entries.into_iter().next(),
+        None => bail!(
+            "multiple preprocessors exported by {}. Available exports: {available}. Select one with {selector_flag} <NAME>",
+            path.display()
+        ),
+    };
+    let entry = selected.ok_or_else(|| anyhow!(
+        "preprocessor export '{}' not found in {}. Available exports: {available}. Select one with {selector_flag} <NAME>",
+        export.unwrap_or_default(), path.display()
+    ))?;
     Ok(LocalPreprocessor {
         name: entry.name,
         slug: entry.slug,
@@ -596,7 +616,7 @@ fn run_preprocessors_runner(files: &[PathBuf]) -> Result<PreprocessorsManifest> 
         let discovery = swc_bundle_js_module(
             &source_file,
             SwcBundleTarget::Discovery,
-            &[],
+            PREPROCESSORS_VIRTUAL_MODULES,
             "preprocessor",
         )?;
         let discovery_bundle = temp_dir
@@ -613,12 +633,13 @@ fn run_preprocessors_runner(files: &[PathBuf]) -> Result<PreprocessorsManifest> 
             )
         })?;
 
-        let quickjs =
-            swc_bundle_js_module(&source_file, SwcBundleTarget::QuickJs, &[], "preprocessor")?;
-        bundled_files.insert(
-            source_key.clone(),
-            quickjs_handler_from_swc_iife(&quickjs.code),
-        );
+        let quickjs = swc_bundle_js_module(
+            &source_file,
+            SwcBundleTarget::QuickJs,
+            PREPROCESSORS_VIRTUAL_MODULES,
+            "preprocessor",
+        )?;
+        bundled_files.insert(source_key.clone(), quickjs.code);
         input_files.push(PreprocessorsDiscoveryInputFile {
             source_file: source_key,
             bundle_file: discovery_bundle.display().to_string(),
@@ -650,7 +671,7 @@ fn run_preprocessors_runner(files: &[PathBuf]) -> Result<PreprocessorsManifest> 
     for file in &mut manifest.files {
         if let Some(bundled) = bundled_files.get(&file.source_file) {
             for entry in &mut file.entries {
-                entry.code.clone_from(bundled);
+                entry.code = quickjs_handler_from_swc_iife(bundled, &entry.export_names[0]);
             }
         }
     }
@@ -660,14 +681,15 @@ fn run_preprocessors_runner(files: &[PathBuf]) -> Result<PreprocessorsManifest> 
 fn module_exports_from_swc_iife(code: &str) -> String {
     let expression = code.trim().trim_end_matches(';');
     format!(
-        "var __BraintrustPreprocessor = {expression};\nmodule.exports = __BraintrustPreprocessor.default;\n"
+        "var __BraintrustPreprocessor = {expression};\nmodule.exports = __BraintrustPreprocessor;\n"
     )
 }
 
-fn quickjs_handler_from_swc_iife(code: &str) -> String {
+fn quickjs_handler_from_swc_iife(code: &str, export: &str) -> String {
+    let export = serde_json::to_string(export).expect("export names serialize to JSON");
     let expression = code.trim().trim_end_matches(';');
     format!(
-        "var __BraintrustPreprocessor = ({expression}).default;\nfunction handler() {{\n  return __BraintrustPreprocessor.handler.apply(__BraintrustPreprocessor, arguments);\n}}\n"
+        "var __BraintrustPreprocessor = ({expression})[{export}];\nfunction handler(span) {{\n  return __BraintrustPreprocessor.handler(span);\n}}\n"
     )
 }
 
@@ -725,7 +747,7 @@ async fn prepare_preprocessors(
 }
 
 fn build_insert_event(preprocessor: &PreparedPreprocessor, if_exists: IfExistsMode) -> Value {
-    let mut event = json!({
+    json!({
         "project_id": preprocessor.project.id,
         "name": preprocessor.entry.name,
         "slug": preprocessor.entry.slug,
@@ -742,13 +764,7 @@ fn build_insert_event(preprocessor: &PreparedPreprocessor, if_exists: IfExistsMo
                 "code": preprocessor.entry.code,
             }
         },
-    });
-
-    if let Some(description) = &preprocessor.entry.description {
-        event["description"] = Value::String(description.clone());
-    }
-
-    event
+    })
 }
 
 fn format_preprocessors_insert_error(
@@ -839,7 +855,7 @@ mod tests {
             entry: PreprocessorManifestEntry {
                 name: slug.to_string(),
                 slug: slug.to_string(),
-                description: None,
+                export_names: vec!["default".to_string()],
                 code: "function handler() { return []; }".to_string(),
                 project_id: None,
                 project_name: None,
@@ -879,17 +895,13 @@ mod tests {
             &path,
             r#"
 import { assistantRole } from "./roles";
+import { customPreprocessor } from "braintrust/preprocessors";
 
 console.log("test discovery log");
-export default {
-  name: "Test Preprocessor",
-  slug: "test-preprocessor",
-  description: "Synthetic preprocessor",
-  project: { id: "proj_test" },
-  handler({ output }: { output: string }): unknown[] {
-    return [{ role: assistantRole, content: output }];
-  },
-};
+export default customPreprocessor(
+  { name: "Test Preprocessor", slug: "test-preprocessor", project: { id: "proj_test" } },
+  ({ output }) => [{ role: assistantRole, content: output }],
+);
 "#,
         )
         .expect("write preprocessor");
@@ -911,9 +923,9 @@ export default {
         let entry = &file.entries[0];
         assert_eq!(entry.name, "Test Preprocessor");
         assert_eq!(entry.slug, "test-preprocessor");
-        assert_eq!(entry.description.as_deref(), Some("Synthetic preprocessor"));
+        assert_eq!(entry.export_names, ["default"]);
         assert_eq!(entry.project_id.as_deref(), Some("proj_test"));
-        assert!(entry.code.contains("function handler()"));
+        assert!(entry.code.contains("function handler(span)"));
         assert!(!entry.code.contains(": string"));
 
         let output = Command::new("node")
@@ -944,7 +956,7 @@ export default {
         let path = dir.path().join("test.preprocessor.ts");
         std::fs::write(
             &path,
-            "export default { name: \"Test\", slug: \"test\" };\n",
+            "export default { kind: \"preprocessor\", name: \"Test\", slug: \"test\" };\n",
         )
         .expect("write preprocessor");
 
@@ -954,13 +966,145 @@ export default {
     }
 
     #[test]
+    fn discovers_multiple_exports_and_selects_their_handlers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.preprocessor.ts");
+        std::fs::write(
+            dir.path().join("shared.ts"),
+            r#"
+import { customPreprocessor } from "braintrust/preprocessors";
+export const skipped = customPreprocessor(
+  { name: "Skipped", slug: "test-skipped", project: "test-project" },
+  () => null,
+);
+"#,
+        )
+        .expect("write dependency");
+        std::fs::write(
+            &path,
+            r#"
+import { customPreprocessor } from "braintrust/preprocessors";
+export { skipped } from "./shared";
+export const unrelated = 42;
+export const structured = customPreprocessor(
+  { name: "Structured", slug: "test-structured", project: { name: "test-project" } },
+  (span) => {
+    if (!span) throw new Error("handler called during discovery");
+    return { id: span.id, root: span.root_span_id, values: [true, 42, span.output] };
+  },
+);
+export { structured as alias };
+export default structured;
+"#,
+        )
+        .expect("write definitions");
+        let manifest = run_preprocessors_runner(std::slice::from_ref(&path)).expect("discover");
+        let entries = &manifest.files[0].entries;
+        assert_eq!(entries.len(), 2);
+        let structured = entries
+            .iter()
+            .find(|entry| entry.slug == "test-structured")
+            .unwrap();
+        assert_eq!(structured.export_names.len(), 3);
+        assert_eq!(structured.project_name.as_deref(), Some("test-project"));
+        for (name, expected) in [
+            (
+                "structured",
+                json!({"id": "test-row", "root": "test-root", "values": [true, 42, "hello"]}),
+            ),
+            (
+                "alias",
+                json!({"id": "test-row", "root": "test-root", "values": [true, 42, "hello"]}),
+            ),
+            (
+                "default",
+                json!({"id": "test-row", "root": "test-root", "values": [true, 42, "hello"]}),
+            ),
+            ("skipped", Value::Null),
+        ] {
+            let selected = load_local_preprocessor(&path, Some(name), "--export").expect("select");
+            let output = Command::new("node").arg("-e").arg(format!(
+                "{}\nconsole.log(JSON.stringify(handler({{ id: 'test-row', root_span_id: 'test-root', output: 'hello' }})));",
+                selected.code,
+            )).output().expect("execute wrapper");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&output.stdout).expect("JSON result"),
+                expected
+            );
+        }
+        for selector in [None, Some("missing"), Some("unrelated")] {
+            let err = load_local_preprocessor(&path, selector, "--preprocessor-export")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--preprocessor-export <NAME>"), "{err}");
+            assert!(
+                err.contains("structured") && err.contains("skipped"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_of_one_definition_do_not_require_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.preprocessor.js");
+        std::fs::write(
+            &path,
+            r#"
+import { customPreprocessor } from "braintrust/preprocessors";
+export const preprocessor = customPreprocessor({ name: "Test", slug: "test" }, () => null);
+export default preprocessor;
+"#,
+        )
+        .expect("write definition");
+        let selected =
+            load_local_preprocessor(&path, None, "--export").expect("automatic selection");
+        assert_eq!(selected.slug, "test");
+    }
+
+    #[test]
+    fn rejects_legacy_and_malformed_definitions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.preprocessor.js");
+        for (source, message) in [
+            (
+                "export default { name: 'Test', slug: 'test', handler: () => null };",
+                "customPreprocessor",
+            ),
+            ("export const unrelated = 42;", "customPreprocessor"),
+            (
+                "export const bad = { kind: 'preprocessor', slug: 'test', handler: () => null };",
+                "name",
+            ),
+            (
+                "export const bad = { kind: 'preprocessor', name: 'Test', handler: () => null };",
+                "slug",
+            ),
+            (
+                "export const bad = { kind: 'preprocessor', name: 'Test', slug: 'test' };",
+                "handler",
+            ),
+        ] {
+            std::fs::write(&path, source).expect("write definition");
+            let err = run_preprocessors_runner(std::slice::from_ref(&path))
+                .expect_err("invalid definition");
+            assert!(format!("{err:#}").contains(message), "{err:#}");
+        }
+    }
+
+    #[test]
     fn bootstrap_template_defines_named_handler() {
         let template =
             preprocessor_bootstrap_template("Test \"Conversation\"", "test-conversation");
 
         assert!(template.contains(r#"name: "Test \"Conversation\"","#));
-        assert!(template.contains(r#"slug: "test-conversation","#));
-        assert!(template.contains("handler({ input, output, span_attributes }"));
+        assert!(template.contains(r#"slug: "test-conversation""#));
+        assert!(template.contains("export const preprocessor = customPreprocessor("));
     }
 
     #[test]

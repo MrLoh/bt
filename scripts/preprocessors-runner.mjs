@@ -6,29 +6,7 @@ function isObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function defaultExportFromModule(loaded) {
-  if (
-    !isObject(loaded) ||
-    !Object.prototype.hasOwnProperty.call(loaded, "default")
-  ) {
-    return undefined;
-  }
-  const value = loaded.default;
-  if (
-    isObject(value) &&
-    Object.prototype.hasOwnProperty.call(value, "default")
-  ) {
-    return value.default;
-  }
-  return value;
-}
-
 function validatePreprocessor(value, sourceFile) {
-  if (!isObject(value)) {
-    throw new Error(
-      `${sourceFile} must default-export a preprocessor definition: { name, slug, handler }`,
-    );
-  }
   if (typeof value.name !== "string" || !value.name.trim()) {
     throw new Error(`${sourceFile} preprocessor name is required`);
   }
@@ -40,15 +18,6 @@ function validatePreprocessor(value, sourceFile) {
   if (typeof value.handler !== "function") {
     throw new Error(
       `${sourceFile} preprocessor '${value.slug}' handler must be a function`,
-    );
-  }
-  if (
-    value.description !== undefined &&
-    value.description !== null &&
-    typeof value.description !== "string"
-  ) {
-    throw new Error(
-      `${sourceFile} preprocessor '${value.slug}' description must be a string`,
     );
   }
 }
@@ -103,22 +72,38 @@ async function buildManifest(inputPath) {
     const loaded = await import(
       `${pathToFileURL(bundleFile).href}?bt_preprocessor_nonce=${Date.now()}`
     );
-    const preprocessor = defaultExportFromModule(loaded);
-    validatePreprocessor(preprocessor, sourceFile);
+    // Discovery bundles are CommonJS and their default import is the full
+    // original module namespace, including its own default export.
+    const entries = new Map();
+    for (const [exportName, preprocessor] of Object.entries(loaded.default)) {
+      if (!isObject(preprocessor) || preprocessor.kind !== "preprocessor") {
+        continue;
+      }
+      validatePreprocessor(
+        preprocessor,
+        `${sourceFile} export '${exportName}'`,
+      );
+      const existing = entries.get(preprocessor);
+      if (existing) {
+        existing.export_names.push(exportName);
+        continue;
+      }
+      entries.set(preprocessor, {
+        export_names: [exportName],
+        name: preprocessor.name,
+        slug: preprocessor.slug,
+        code: "",
+        ...projectFields(preprocessor.project),
+      });
+    }
+    if (entries.size === 0) {
+      throw new Error(
+        `${sourceFile} must export customPreprocessor(...) from "braintrust/preprocessors"`,
+      );
+    }
     manifest.files.push({
       source_file: sourceFile,
-      entries: [
-        {
-          name: preprocessor.name,
-          slug: preprocessor.slug,
-          ...(typeof preprocessor.description === "string" &&
-          preprocessor.description.trim()
-            ? { description: preprocessor.description }
-            : {}),
-          code: "",
-          ...projectFields(preprocessor.project),
-        },
-      ],
+      entries: [...entries.values()],
     });
   }
 

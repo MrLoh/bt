@@ -2280,6 +2280,7 @@ fn preprocessors_preview_help_lists_trace_selectors() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--trace-id"))
+        .stdout(predicate::str::contains("--export <NAME>"))
         .stdout(predicate::str::contains("--url"))
         .stdout(predicate::str::contains("--project-id"));
 }
@@ -2302,10 +2303,10 @@ fn preprocessors_bootstrap_creates_starter_file() {
             .join("braintrust-preprocessors/conversation-review.preprocessor.ts"),
     )
     .expect("read starter preprocessor");
-    assert!(contents.contains("export default {"));
+    assert!(contents.contains("export const preprocessor = customPreprocessor("));
     assert!(contents.contains(r#"name: "Conversation Review""#));
     assert!(contents.contains(r#"slug: "conversation-review""#));
-    assert!(contents.contains("handler({ input, output, span_attributes }"));
+    assert!(contents.contains("return null;"));
 }
 
 #[test]
@@ -2451,13 +2452,13 @@ fn preprocessors_bootstrap_requires_force_to_overwrite() {
 
     let contents =
         fs::read_to_string(dir.path().join("test.preprocessor.ts")).expect("read preprocessor");
-    assert!(contents.contains("export default {"));
+    assert!(contents.contains("export const preprocessor = customPreprocessor("));
 }
 
 #[test]
 fn preprocessors_starter_typechecks() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(root).expect("tempdir");
     bt_command()
         .current_dir(dir.path())
         .args(["preprocessors", "bootstrap", "Test Preprocessor"])
@@ -2496,6 +2497,7 @@ fn scorers_create_help_lists_preprocessor_sources() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--preprocessor <SOURCE>"))
+        .stdout(predicate::str::contains("--preprocessor-export <NAME>"))
         .stdout(predicate::str::contains("global:<NAME>"));
 }
 
@@ -2905,4 +2907,53 @@ fn datasets_requires_profile_selection_when_multiple_profiles_exist() {
         .stderr(predicate::str::contains("--profile <NAME>"))
         .stderr(predicate::str::contains("alpha"))
         .stderr(predicate::str::contains("beta"));
+}
+
+#[test]
+fn preprocessors_preview_export_flag_overrides_env() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("test.preprocessor.ts"),
+        r#"
+import { customPreprocessor } from "braintrust/preprocessors";
+export const first = customPreprocessor({ name: "First", slug: "test-first" }, () => null);
+export const second = customPreprocessor({ name: "Second", slug: "test-second" }, () => null);
+"#,
+    )
+    .expect("write definitions");
+    for (flags, expected) in [
+        (vec![], "env-missing"),
+        (vec!["--export", "flag-missing"], "flag-missing"),
+    ] {
+        bt_command()
+            .current_dir(dir.path())
+            .env("BT_PREPROCESSORS_PREVIEW_EXPORT", "env-missing")
+            .args(["preprocessors", "preview", "test.preprocessor.ts"])
+            .args(flags)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(format!(
+                "preprocessor export '{expected}' not found"
+            )))
+            .stderr(predicate::str::contains("--export <NAME>"));
+    }
+}
+
+#[test]
+fn scorers_preprocessor_export_requires_source() {
+    bt_command()
+        .args([
+            "scorers",
+            "create",
+            "Test",
+            "--model",
+            "test-model",
+            "--messages",
+            "[]",
+            "--preprocessor-export",
+            "test",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--preprocessor <SOURCE>"));
 }

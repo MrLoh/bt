@@ -123,6 +123,10 @@ pub(crate) struct CreateArgs {
     #[arg(long, value_name = "SOURCE")]
     preprocessor: Option<String>,
 
+    /// Export name to inline from a local --preprocessor @PATH file.
+    #[arg(long, value_name = "NAME", requires = "preprocessor")]
+    preprocessor_export: Option<String>,
+
     /// Behavior when a scorer with the same slug already exists.
     #[arg(long, value_enum, default_value = "error")]
     if_exists: IfExistsMode,
@@ -134,9 +138,10 @@ pub(crate) async fn run(ctx: &ResolvedContext, args: &CreateArgs, json_output: b
     let mut definition =
         build_scorer_definition(args, &ctx.project.id, &name, &slug).map_err(user_error)?;
     if let Some(source) = args.preprocessor.as_deref() {
-        definition["prompt_data"]["preprocessor"] = resolve_preprocessor(ctx, source)
-            .await
-            .map_err(user_error)?;
+        definition["prompt_data"]["preprocessor"] =
+            resolve_preprocessor(ctx, source, args.preprocessor_export.as_deref())
+                .await
+                .map_err(user_error)?;
     }
 
     let result = match with_spinner(
@@ -292,6 +297,17 @@ fn build_scorer_definition(
     name: &str,
     slug: &str,
 ) -> Result<Value> {
+    if args.preprocessor_export.is_some()
+        && !matches!(
+            args.preprocessor
+                .as_deref()
+                .map(parse_preprocessor_source)
+                .transpose()?,
+            Some(PreprocessorSource::File(_))
+        )
+    {
+        bail!("--preprocessor-export requires --preprocessor @PATH");
+    }
     let prompt = resolve_prompt_block(args)?;
     let (function_type, parser) = resolve_output_parser(args)?;
 
@@ -407,7 +423,11 @@ fn parse_preprocessor_source(source: &str) -> Result<PreprocessorSource<'_>> {
     Ok(PreprocessorSource::Saved(source))
 }
 
-async fn resolve_preprocessor(ctx: &ResolvedContext, source: &str) -> Result<Value> {
+async fn resolve_preprocessor(
+    ctx: &ResolvedContext,
+    source: &str,
+    export: Option<&str>,
+) -> Result<Value> {
     match parse_preprocessor_source(source)? {
         PreprocessorSource::Disabled => Ok(Value::Null),
         PreprocessorSource::Global(name) => Ok(json!({
@@ -416,7 +436,7 @@ async fn resolve_preprocessor(ctx: &ResolvedContext, source: &str) -> Result<Val
             "function_type": "preprocessor",
         })),
         PreprocessorSource::File(path) => {
-            let preprocessor = load_local_preprocessor(path)?;
+            let preprocessor = load_local_preprocessor(path, export, "--preprocessor-export")?;
             Ok(json!({ "type": "inline", "code": preprocessor.code }))
         }
         PreprocessorSource::Saved(slug) => {
@@ -475,6 +495,7 @@ mod tests {
             pass_threshold: None,
             metadata: None,
             preprocessor: None,
+            preprocessor_export: None,
             if_exists: IfExistsMode::Error,
         }
     }
@@ -663,6 +684,27 @@ mod tests {
             resolve_name(&parsed.args).expect("resolve name"),
             "Positional name"
         );
+    }
+
+    #[test]
+    fn preprocessor_export_requires_local_file() {
+        let mut args = args();
+        args.preprocessor_export = Some("conversation".to_string());
+        for source in [
+            None,
+            Some("conversation"),
+            Some("global:thread"),
+            Some("none"),
+        ] {
+            args.preprocessor = source.map(str::to_string);
+            let err = build_scorer_definition(&args, "test-project", "Test", "test")
+                .expect_err("selector requires local file");
+            assert!(err
+                .to_string()
+                .contains("--preprocessor-export requires --preprocessor @PATH"));
+        }
+        args.preprocessor = Some("@test.preprocessor.ts".to_string());
+        build_scorer_definition(&args, "test-project", "Test", "test").expect("local selector");
     }
 
     #[test]
