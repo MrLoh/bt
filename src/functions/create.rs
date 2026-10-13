@@ -199,33 +199,7 @@ fn report_validation_issues(report: &api::FunctionValidationReport) -> Result<()
     let mut blocking = Vec::new();
     for result in &report.results {
         for issue in &result.issues {
-            let path = issue
-                .path
-                .iter()
-                .map(|part| {
-                    part.as_str()
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_else(|| part.to_string())
-                })
-                .collect::<Vec<_>>()
-                .join(".");
-            let location = if path.is_empty() {
-                issue.code.clone()
-            } else {
-                path
-            };
-            let suggestion = issue
-                .suggestion
-                .as_ref()
-                .map(
-                    |suggestion| match (suggestion.action.as_str(), &suggestion.value) {
-                        ("remove", _) => "; suggestion: remove this parameter".to_string(),
-                        ("set", Some(value)) => format!("; suggestion: set it to {value}"),
-                        _ => String::new(),
-                    },
-                )
-                .unwrap_or_default();
-            let message = format!("{location}: {}{suggestion}", issue.message);
+            let message = issue.to_string();
             if issue.blocking {
                 blocking.push(message);
             } else {

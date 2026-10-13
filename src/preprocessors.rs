@@ -68,7 +68,7 @@ struct PushArgs {
     /// File or directory path(s) to scan for preprocessor definitions.
     #[arg(
         long = "file",
-        env = "BT_PREPROCESSORS_PUSH_FILES",
+        env = "BRAINTRUST_PREPROCESSORS_PUSH_FILES",
         value_name = "PATH",
         value_delimiter = ','
     )]
@@ -77,7 +77,7 @@ struct PushArgs {
     /// Behavior when a preprocessor with the same slug already exists.
     #[arg(
         long = "if-exists",
-        env = "BT_PREPROCESSORS_PUSH_IF_EXISTS",
+        env = "BRAINTRUST_PREPROCESSORS_PUSH_IF_EXISTS",
         value_enum,
         default_value = "error"
     )]
@@ -87,7 +87,7 @@ struct PushArgs {
     #[arg(
         long,
         short = 'y',
-        env = "BT_PREPROCESSORS_PUSH_YES",
+        env = "BRAINTRUST_PREPROCESSORS_PUSH_YES",
         value_parser = BoolishValueParser::new(),
         default_value_t = false
     )]
@@ -115,7 +115,7 @@ struct BootstrapArgs {
     /// Preprocessor name (positional NAME takes precedence).
     #[arg(
         long = "name",
-        env = "BT_PREPROCESSORS_BOOTSTRAP_NAME",
+        env = "BRAINTRUST_PREPROCESSORS_BOOTSTRAP_NAME",
         value_name = "NAME"
     )]
     name_flag: Option<String>,
@@ -123,7 +123,7 @@ struct BootstrapArgs {
     /// Output file or directory path. Defaults to braintrust-preprocessors/<name>.preprocessor.ts.
     #[arg(
         long = "file",
-        env = "BT_PREPROCESSORS_BOOTSTRAP_FILE",
+        env = "BRAINTRUST_PREPROCESSORS_BOOTSTRAP_FILE",
         value_name = "PATH"
     )]
     file_flag: Option<PathBuf>,
@@ -132,7 +132,7 @@ struct BootstrapArgs {
     #[arg(
         long,
         short = 'f',
-        env = "BT_PREPROCESSORS_BOOTSTRAP_FORCE",
+        env = "BRAINTRUST_PREPROCESSORS_BOOTSTRAP_FORCE",
         value_parser = BoolishValueParser::new(),
         default_value_t = false
     )]
@@ -158,28 +158,32 @@ struct PreviewArgs {
     #[arg(
         long = "file",
         alias = "path",
-        env = "BT_PREPROCESSORS_PREVIEW_FILE",
+        env = "BRAINTRUST_PREPROCESSORS_PREVIEW_FILE",
         value_name = "PATH"
     )]
     file_flag: Option<PathBuf>,
 
     /// Export name to preview when the file contains multiple preprocessors.
-    #[arg(long, env = "BT_PREPROCESSORS_PREVIEW_EXPORT", value_name = "NAME")]
+    #[arg(
+        long,
+        env = "BRAINTRUST_PREPROCESSORS_PREVIEW_EXPORT",
+        value_name = "NAME"
+    )]
     export: Option<String>,
 
     /// Braintrust app URL of the trace to preprocess.
-    #[arg(long, env = "BT_PREPROCESSORS_PREVIEW_URL")]
+    #[arg(long, env = "BRAINTRUST_PREPROCESSORS_PREVIEW_URL")]
     url: Option<String>,
 
     /// Project ID of the trace to preprocess.
-    #[arg(long, env = "BT_PREPROCESSORS_PREVIEW_PROJECT_ID")]
+    #[arg(long, env = "BRAINTRUST_PREPROCESSORS_PREVIEW_PROJECT_ID")]
     project_id: Option<String>,
 
     /// Root span id of the trace to preprocess.
     #[arg(
         long = "trace-id",
         alias = "root-span-id",
-        env = "BT_PREPROCESSORS_PREVIEW_TRACE_ID"
+        env = "BRAINTRUST_PREPROCESSORS_PREVIEW_TRACE_ID"
     )]
     trace_id: Option<String>,
 
@@ -187,7 +191,7 @@ struct PreviewArgs {
     /// Root span IDs and row IDs do not require a time window.
     #[arg(
         long,
-        env = "BT_PREPROCESSORS_PREVIEW_LOOKUP_WINDOW",
+        env = "BRAINTRUST_PREPROCESSORS_PREVIEW_LOOKUP_WINDOW",
         default_value = "30d"
     )]
     lookup_window: String,
@@ -788,7 +792,11 @@ fn format_preprocessors_insert_error(
         preprocessor_list
     };
     let details = format!("{err:#}");
-    let retry_hint = if if_exists == IfExistsMode::Error {
+    let normalized = details.to_ascii_lowercase();
+    let retry_hint = if if_exists == IfExistsMode::Error
+        && (normalized.contains("slug already exists")
+            || normalized.contains("slugs already exist"))
+    {
         " If you are updating an existing preprocessor, rerun with `bt preprocessors push --if-exists replace`."
     } else {
         ""
@@ -1166,6 +1174,68 @@ export default preprocessor;
         assert!(message.contains("--if-exists error"));
         assert!(message.contains("bt preprocessors push --if-exists replace"));
         assert!(message.contains("slug already exists"));
+    }
+
+    #[test]
+    fn insert_error_preserves_validation_details_without_replacement_hint() {
+        let report = serde_json::from_value(json!({
+            "valid": false,
+            "results": [{
+                "issues": [{
+                    "code": "invalid_value",
+                    "path": ["functions", 0, "function_data", "data", "runtime_context", "version"],
+                    "message": "Unsupported runtime version",
+                    "blocking": true,
+                    "suggestion": { "action": "set", "value": "latest" }
+                }, {
+                    "code": "unsupported_parameter",
+                    "path": [],
+                    "message": "Remove the unsupported parameter",
+                    "blocking": true,
+                    "suggestion": { "action": "remove" }
+                }]
+            }]
+        }))
+        .expect("validation report");
+        let err = anyhow::Error::new(functions_api::FunctionValidationError { report });
+        let message = format_preprocessors_insert_error(
+            &[test_preprocessor("test-preprocessor")],
+            IfExistsMode::Error,
+            &err,
+        );
+
+        assert!(message.contains(
+            "functions.0.function_data.data.runtime_context.version: Unsupported runtime version; suggestion: set it to \"latest\""
+        ));
+        assert!(message.contains(
+            "unsupported_parameter: Remove the unsupported parameter; suggestion: remove this parameter"
+        ));
+        assert!(!message.contains("--if-exists replace"));
+    }
+
+    #[test]
+    fn insert_error_only_suggests_replacement_for_slug_conflicts_in_error_mode() {
+        for (details, mode, expect_hint) in [
+            (
+                "Slugs already exist: test-preprocessor",
+                IfExistsMode::Error,
+                true,
+            ),
+            ("slug already exists", IfExistsMode::Replace, false),
+            ("slug already exists", IfExistsMode::Ignore, false),
+            (
+                "request failed (401 Unauthorized)",
+                IfExistsMode::Error,
+                false,
+            ),
+        ] {
+            let message = format_preprocessors_insert_error(
+                &[test_preprocessor("test-preprocessor")],
+                mode,
+                &anyhow!(details),
+            );
+            assert_eq!(message.contains("rerun with"), expect_hint, "{message}");
+        }
     }
 
     #[test]

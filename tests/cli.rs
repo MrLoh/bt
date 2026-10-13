@@ -2270,7 +2270,9 @@ fn preprocessors_push_help_lists_preprocessor_flags() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--if-exists"))
-        .stdout(predicate::str::contains("BT_PREPROCESSORS_PUSH_FILES"));
+        .stdout(predicate::str::contains(
+            "BRAINTRUST_PREPROCESSORS_PUSH_FILES",
+        ));
 }
 
 #[test]
@@ -2323,7 +2325,10 @@ fn preprocessors_bootstrap_accepts_named_and_env_names_with_positional_precedenc
         let dir = tempfile::tempdir().expect("tempdir");
         bt_command()
             .current_dir(dir.path())
-            .env("BT_PREPROCESSORS_BOOTSTRAP_NAME", "Env Preprocessor")
+            .env(
+                "BRAINTRUST_PREPROCESSORS_BOOTSTRAP_NAME",
+                "Env Preprocessor",
+            )
             .args(["preprocessors", "bootstrap"])
             .args(inputs)
             .args(["--file", "test.preprocessor.ts"])
@@ -2364,7 +2369,10 @@ fn preprocessors_preview_accepts_named_and_env_paths_with_positional_precedence(
         let dir = tempfile::tempdir().expect("tempdir");
         bt_command()
             .current_dir(dir.path())
-            .env("BT_PREPROCESSORS_PREVIEW_FILE", "env.preprocessor.ts")
+            .env(
+                "BRAINTRUST_PREPROCESSORS_PREVIEW_FILE",
+                "env.preprocessor.ts",
+            )
             .args(["preprocessors", "preview"])
             .args(inputs)
             .assert()
@@ -2379,8 +2387,8 @@ fn preprocessors_preview_accepts_named_and_env_paths_with_positional_precedence(
 fn preprocessors_bootstrap_and_preview_require_primary_inputs() {
     for command in ["bootstrap", "preview"] {
         bt_command()
-            .env_remove("BT_PREPROCESSORS_BOOTSTRAP_NAME")
-            .env_remove("BT_PREPROCESSORS_PREVIEW_FILE")
+            .env_remove("BRAINTRUST_PREPROCESSORS_BOOTSTRAP_NAME")
+            .env_remove("BRAINTRUST_PREPROCESSORS_PREVIEW_FILE")
             .args(["preprocessors", command])
             .assert()
             .failure()
@@ -2927,7 +2935,7 @@ export const second = customPreprocessor({ name: "Second", slug: "test-second" }
     ] {
         bt_command()
             .current_dir(dir.path())
-            .env("BT_PREPROCESSORS_PREVIEW_EXPORT", "env-missing")
+            .env("BRAINTRUST_PREPROCESSORS_PREVIEW_EXPORT", "env-missing")
             .args(["preprocessors", "preview", "test.preprocessor.ts"])
             .args(flags)
             .assert()
